@@ -1,0 +1,106 @@
+from pathlib import Path
+import numpy as np, pandas as pd, matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
+
+# 1-3. Load, inspect, find problems
+name = "trades_orderbook_STUDENT_dirty.csv"
+here = Path(__file__).parent
+candidates = [here / name, here.parent / name, Path.cwd() / name,
+              Path.home() / "Downloads" / name, Path.home() / "Desktop" / name]
+csv_path = next((p for p in candidates if p.exists()), None)
+if csv_path is None:                                   # not found: ask the user to pick it
+    from tkinter import Tk, filedialog
+    Tk().withdraw()
+    csv_path = filedialog.askopenfilename(title="Select trades_orderbook_STUDENT_dirty.csv")
+print("Using:", csv_path)
+df = pd.read_csv(csv_path)
+
+print(df.shape, df.dtypes, df.describe(), df.side.value_counts(dropna=False),
+      df.symbol.value_counts(), df.isna().sum(), sep="\n")
+print("dup ids:", df.trade_id.duplicated().sum())
+
+# 4. Clean
+df = df.drop_duplicates("trade_id")
+df["side"] = df.side.str.strip().str.lower()
+df["symbol"] = df.symbol.str.upper().str.replace(r"[^A-Z0-9]", "", regex=True)
+df["price"] = pd.to_numeric(df.price.astype(str).str.replace(r"[^0-9.\-]", "", regex=True), errors="coerce")
+
+ts = df.timestamp.astype(str)
+epoch, slash = ts.str.fullmatch(r"\d{9,13}"), ts.str.contains("/")
+df["timestamp"] = pd.to_datetime(ts.mask(epoch | slash), errors="coerce", utc=True)
+df.loc[epoch, "timestamp"] = pd.to_datetime(ts[epoch].astype(float), unit="s", utc=True)
+df.loc[slash, "timestamp"] = pd.to_datetime(ts[slash], format="%d/%m/%Y %H:%M:%S", utc=True)
+
+key = ["timestamp", "price", "quantity", "bid_price_1", "ask_price_1", "bid_qty_1", "ask_qty_1"]
+df = df.dropna(subset=key)                                     # missing key fields
+df = df[(df[key[1:]] > 0).all(axis=1)]                         # zero/negative values
+df = df[df.bid_price_1 <= df.ask_price_1]                      # crossed books
+df = df.sort_values("timestamp").reset_index(drop=True)
+
+# 5. Outliers: compare price with the rolling median AND the order-book mid
+med = df.price.rolling(51, center=True, min_periods=5).median()
+mid0 = (df.bid_price_1 + df.ask_price_1) / 2
+bad = ((df.price / med - 1).abs() > 0.005) | ((df.price / mid0 - 1).abs() > 0.005)
+print("outliers found:", bad.sum())
+
+# Correct the x100 price errors (price/100 matches the book), drop anything else
+fixable = bad & ((df.price / 100 / mid0 - 1).abs() <= 0.005)
+df.loc[fixable, "price"] = df.price / 100
+df = df[~(bad & ~fixable)].reset_index(drop=True)
+print("corrected:", fixable.sum(), "dropped:", (bad & ~fixable).sum(), "rows left:", len(df))
+
+# 6. Features (tick level)
+df["spread"] = (df.ask_price_1 - df.bid_price_1).round(2)
+df["mid"] = (df.ask_price_1 + df.bid_price_1) / 2
+df["imb"] = (df.bid_qty_1 - df.ask_qty_1) / (df.bid_qty_1 + df.ask_qty_1)
+df["ret"] = df.mid.pct_change()                              # past only
+df["vol50"] = df.ret.rolling(50, min_periods=10).std()       # past only
+
+# 7. 1-minute OHLCV candles
+t = df.set_index("timestamp").sort_index()
+c = t.price.resample("1min").ohlc()
+c["volume"] = t.quantity.resample("1min").sum()
+c["spread"] = t.spread.resample("1min").mean()
+c["imb"] = t.imb.resample("1min").mean()
+c["buy_ratio"] = t.side.map({"buy": 1.0, "sell": 0.0}).resample("1min").mean()
+c["close"] = c.close.ffill()                                 # empty minute keeps last close
+c["volume"] = c.volume.fillna(0)
+c[["spread", "imb", "buy_ratio"]] = c[["spread", "imb", "buy_ratio"]].ffill()
+c = c.dropna(subset=["close"])
+
+c["ret"] = c.close.pct_change()
+c["vol3"] = c.ret.rolling(3, min_periods=2).std()
+c["sma5"] = c.close.rolling(5, min_periods=5).mean()
+c["sma10"] = c.close.rolling(10, min_periods=5).mean()
+d = c.close.diff()
+gain = d.clip(lower=0).rolling(7, min_periods=4).mean()
+loss = (-d.clip(upper=0)).rolling(7, min_periods=4).mean()
+c["rsi7"] = 100 - 100 / (1 + gain / loss.replace(0, np.nan))
+
+# 8. Visualize
+feats = ["volume", "spread", "imb", "buy_ratio", "ret", "vol3", "sma5", "sma10", "rsi7"]
+fig, ax = plt.subplots(2, 3, figsize=(15, 8))
+ax[0, 0].plot(c.close); ax[0, 0].set_title("Close (1-min)")
+ax[0, 1].hist(c.volume, 30); ax[0, 1].set_title("Volume per minute")
+ax[0, 2].hist(df.spread, 30); ax[0, 2].set_title("Spread")
+df.side.value_counts().plot.bar(ax=ax[1, 0], title="Buy vs sell", rot=0)
+im = ax[1, 1].imshow(c[feats].corr(), cmap="coolwarm", vmin=-1, vmax=1)
+ax[1, 1].set_xticks(range(len(feats)), feats, rotation=90)
+ax[1, 1].set_yticks(range(len(feats)), feats)
+ax[1, 1].set_title("Correlation"); fig.colorbar(im, ax=ax[1, 1]); ax[1, 2].axis("off")
+plt.tight_layout(); plt.savefig("eda_plots.png"); plt.show()
+
+# 9. Target, time split, scaling
+H = 5                                                        # horizon in minutes
+c["target"] = (c.close.shift(-H) > c.close).astype(int)      # up in next 5 min
+data = c.dropna(subset=feats).iloc[:-H]                      # last 5 rows have no future price
+cut = int(len(data) * 0.7)
+train = data.iloc[:cut - H]                                  # purge H rows to avoid leakage
+test = data.iloc[cut:]
+sc = StandardScaler().fit(train[feats])                      # fit on train only
+X_train, X_test = sc.transform(train[feats]), sc.transform(test[feats])
+y_train, y_test = train.target.values, test.target.values
+print(f"train={len(train)} test={len(test)}; 'imb > 0.3' signals in test: {(test.imb > 0.3).sum()}")
+
+df.to_csv("trades_orderbook_clean.csv", index=False)
+data.to_csv("candles_1m_features.csv")
