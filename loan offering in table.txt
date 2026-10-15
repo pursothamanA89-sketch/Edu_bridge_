@@ -1,0 +1,51 @@
+import numpy as np
+import pandas as pd
+from sklearn.linear_model import LinearRegression
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+
+# 1. Sample dataset (replace with pd.read_csv("your_loan_data.csv"))
+rng = np.random.default_rng(42)
+n = 200
+df = pd.DataFrame({
+    "income": rng.integers(15000, 120000, n),        # monthly income
+    "credit_score": rng.integers(300, 900, n),
+    "loan_amount": rng.integers(50000, 2000000, n),
+    "employment_years": rng.integers(0, 25, n),
+})
+
+# Rule used only to create sample labels: 1 = approved, 0 = rejected
+score = (
+    0.00003 * df["income"]
+    + 0.004 * df["credit_score"]
+    - 0.0000009 * df["loan_amount"]
+    + 0.03 * df["employment_years"]
+    + rng.normal(0, 0.3, n)
+)
+df["loan_status"] = (score > score.median()).astype(int)
+
+# 2. Split data
+X = df[["income", "credit_score", "loan_amount", "employment_years"]]
+y = df["loan_status"]
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=1
+)
+
+# 3. Train linear regression
+model = LinearRegression()
+model.fit(X_train, y_train)
+
+# 4. Predict score and apply 0.5 cutoff
+pred_score = model.predict(X_test)
+pred_label = (pred_score >= 0.5).astype(int)
+
+# 5. Result table
+result = X_test.copy()
+result["predicted_score"] = pred_score.round(3)
+result["actual"] = y_test.map({1: "Approved", 0: "Rejected"})
+result["prediction"] = pd.Series(pred_label, index=X_test.index).map(
+    {1: "Eligible", 0: "Not Eligible"}
+)
+
+print(result.head(15).to_string(index=False))
+print("\nAccuracy:", round(accuracy_score(y_test, pred_label) * 100, 2), "%")
